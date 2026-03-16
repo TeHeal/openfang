@@ -1777,9 +1777,37 @@ Manage recurring and one-shot scheduled jobs. Jobs can trigger agent turns, syst
 
 ### GET /api/cron/jobs
 
-List all cron jobs.
+List all cron jobs. Optionally filter by agent with `?agent_id=<uuid>`.
 
-**Response** `200 OK`: Array of `CronJob` objects.
+**Response** `200 OK`:
+
+```json
+{
+  "jobs": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "agent_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "name": "daily-report",
+      "enabled": true,
+      "schedule": { "kind": "every", "every_secs": 3600 },
+      "action": {
+        "kind": "agent_turn",
+        "message": "Generate the daily report",
+        "timeout_secs": 120
+      },
+      "delivery": {
+        "kind": "channel",
+        "channel": "slack",
+        "to": "#reports"
+      },
+      "created_at": "2026-03-15T10:30:00Z",
+      "last_run": "2026-03-16T09:00:00Z",
+      "next_run": "2026-03-16T10:00:00Z"
+    }
+  ],
+  "total": 1
+}
+```
 
 ### POST /api/cron/jobs
 
@@ -1789,9 +1817,8 @@ Create a new cron job.
 
 ```json
 {
-  "agent_id": "uuid",
+  "agent_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
   "name": "daily-report",
-  "enabled": true,
   "schedule": { "kind": "every", "every_secs": 3600 },
   "action": {
     "kind": "agent_turn",
@@ -1806,7 +1833,13 @@ Create a new cron job.
 }
 ```
 
-**Response** `200 OK`: The created `CronJob` object with assigned `id`.
+**Response** `201 Created`:
+
+```json
+{
+  "result": "{\"job_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"status\":\"created\"}"
+}
+```
 
 ### DELETE /api/cron/jobs/{id}
 
@@ -1838,7 +1871,30 @@ Enable or disable a cron job.
 
 Get job metadata including last run time, status, and error history.
 
-**Response** `200 OK`: `JobMeta` object with fields like `last_run`, `last_status`, `consecutive_errors`.
+**Response** `200 OK`:
+
+```json
+{
+  "job": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "agent_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "name": "daily-report",
+    "enabled": true,
+    "schedule": { "kind": "every", "every_secs": 3600 },
+    "action": {
+      "kind": "agent_turn",
+      "message": "Generate the daily report",
+      "timeout_secs": 120
+    },
+    "delivery": { "kind": "none" },
+    "created_at": "2026-03-15T10:30:00Z",
+    "last_run": "2026-03-16T09:00:00Z",
+    "next_run": "2026-03-16T10:00:00Z"
+  },
+  "one_shot": false,
+  "last_status": "ok",
+  "consecutive_errors": 0
+}
 
 ### POST /api/cron/jobs/{id}/run
 
