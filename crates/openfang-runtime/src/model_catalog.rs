@@ -3463,7 +3463,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec![],
         },
         // ══════════════════════════════════════════════════════════════
-        // Volcano Engine / Doubao (4)
+        // Volcano Engine / Doubao (5)
         // ══════════════════════════════════════════════════════════════
         ModelCatalogEntry {
             id: "doubao-seed-1-6-251015".into(),
@@ -3480,7 +3480,21 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             aliases: vec!["doubao".into(), "doubao-pro".into()],
         },
         ModelCatalogEntry {
-            id: "doubao-seed-2-0-lite".into(),
+            id: "doubao-seed-2-0-pro-260215".into(),
+            display_name: "Doubao Seed 2.0 Pro".into(),
+            provider: "volcengine".into(),
+            tier: ModelTier::Frontier,
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+            input_cost_per_m: 0.0,
+            output_cost_per_m: 0.0,
+            supports_tools: true,
+            supports_vision: true,
+            supports_streaming: true,
+            aliases: vec!["doubao-seed-2-0-pro".into()],
+        },
+        ModelCatalogEntry {
+            id: "doubao-seed-2-0-lite-260215".into(),
             display_name: "Doubao Seed 2.0 Lite".into(),
             provider: "volcengine".into(),
             tier: ModelTier::Balanced,
@@ -3489,12 +3503,12 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             input_cost_per_m: 0.30,
             output_cost_per_m: 0.60,
             supports_tools: true,
-            supports_vision: false,
+            supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["doubao-lite".into()],
+            aliases: vec!["doubao-seed-2-0-lite".into(), "doubao-lite".into()],
         },
         ModelCatalogEntry {
-            id: "doubao-seed-2-0-mini".into(),
+            id: "doubao-seed-2-0-mini-260215".into(),
             display_name: "Doubao Seed 2.0 Mini".into(),
             provider: "volcengine".into(),
             tier: ModelTier::Fast,
@@ -3503,9 +3517,9 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             input_cost_per_m: 0.10,
             output_cost_per_m: 0.10,
             supports_tools: true,
-            supports_vision: false,
+            supports_vision: true,
             supports_streaming: true,
-            aliases: vec!["doubao-mini".into()],
+            aliases: vec!["doubao-seed-2-0-mini".into(), "doubao-mini".into()],
         },
         ModelCatalogEntry {
             id: "doubao-seed-code".into(),

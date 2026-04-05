@@ -11,6 +11,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/clip/SKILL.md"),
         ),
         (
+            "autoclip",
+            include_str!("../bundled/autoclip/HAND.toml"),
+            include_str!("../bundled/autoclip/SKILL.md"),
+        ),
+        (
             "lead",
             include_str!("../bundled/lead/HAND.toml"),
             include_str!("../bundled/lead/SKILL.md"),
@@ -81,7 +86,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 9);
+        assert_eq!(hands.len(), 10);
     }
 
     #[test]
@@ -97,6 +102,29 @@ mod tests {
         assert!(!def.tools.is_empty());
         assert!(!def.agent.system_prompt.is_empty());
         assert!(!def.dashboard.metrics.is_empty());
+    }
+
+    #[test]
+    fn parse_autoclip_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "autoclip")
+            .expect("autoclip hand must be in bundled_hands()");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "autoclip");
+        assert_eq!(def.name, "AutoClip Hand");
+        assert_eq!(def.category, crate::HandCategory::Content);
+        assert!(def.skill_content.is_some());
+        assert!(!def.requires.is_empty());
+        assert!(!def.tools.is_empty());
+        assert!(!def.agent.system_prompt.is_empty());
+        assert!(!def.dashboard.metrics.is_empty());
+        assert!(
+            def.agent
+                .system_prompt
+                .contains("REQUIREMENTS.md"),
+            "autoclip prompt should reference product requirements"
+        );
     }
 
     #[test]

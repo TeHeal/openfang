@@ -1,13 +1,25 @@
 //! Media understanding engine — image description, audio transcription, video analysis.
 //!
 //! Auto-cascades through available providers based on configured API keys.
+//! Vision: prioritises mainland-compatible OpenAI-style APIs (DashScope Qwen-VL, Zhipu GLM-4V,
+//! Volcengine Ark 豆包, then OpenAI); video uses ffmpeg frame sampling + the same vision stack.
 
 use openfang_types::media::{
     MediaAttachment, MediaConfig, MediaSource, MediaType, MediaUnderstanding,
 };
+use openfang_types::model_catalog::VOLCENGINE_BASE_URL;
+use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::info;
+
+const QWEN_CHAT_COMPLETIONS_URL: &str =
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+const ZHIPU_CHAT_COMPLETIONS_URL: &str =
+    "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+const OPENAI_CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 /// Media understanding engine.
 pub struct MediaEngine {
@@ -24,32 +36,136 @@ impl MediaEngine {
         }
     }
 
-    /// Describe an image using a vision-capable LLM.
-    /// Auto-cascade: Anthropic -> OpenAI -> Gemini (based on API key availability).
+    /// Describe an image using a vision-capable LLM (no custom prompt).
     pub async fn describe_image(
         &self,
         attachment: &MediaAttachment,
+    ) -> Result<MediaUnderstanding, String> {
+        self.describe_image_prompt(attachment, None).await
+    }
+
+    /// Describe an image with an optional user prompt (e.g. editing-oriented instructions).
+    ///
+    /// Provider order (unless `OPENFANG_VISION_PROVIDER` overrides): **Qwen-VL** (DashScope),
+    /// **GLM-4V** (Zhipu), **豆包** (火山 Ark), OpenAI, then legacy stubs for Gemini/Anthropic.
+    pub async fn describe_image_prompt(
+        &self,
+        attachment: &MediaAttachment,
+        prompt: Option<&str>,
     ) -> Result<MediaUnderstanding, String> {
         attachment.validate()?;
         if attachment.media_type != MediaType::Image {
             return Err("Expected image attachment".into());
         }
 
-        // Determine which provider to use
-        let provider = self.config.image_provider.as_deref()
-            .or_else(|| detect_vision_provider())
-            .ok_or("No vision-capable LLM provider configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY")?;
+        let _permit = self.semaphore.acquire().await.map_err(|e| e.to_string())?;
 
-        // For now, return a structured result indicating the provider.
-        // Actual API call would go here using reqwest.
+        let (image_bytes, mime) = read_image_bytes(attachment).await?;
+        let provider = self
+            .config
+            .image_provider
+            .as_deref()
+            .or_else(|| detect_vision_provider())
+            .ok_or(
+                "No vision provider configured. For mainland CN: set DASHSCOPE_API_KEY (Qwen-VL), \
+                 ZHIPU_API_KEY (GLM-4V), VOLCENGINE_API_KEY (火山豆包 Ark), or OPENAI_API_KEY. \
+                 Optional: OPENFANG_VISION_PROVIDER=qwen|zhipu|volcengine|openai",
+            )?;
+
+        let default_prompt = "Describe this image in detail: main subjects, setting, actions, \
+             on-screen text if any, mood, and anything relevant for video editing or highlight selection.";
+        let text_prompt = prompt.unwrap_or(default_prompt);
+
+        let (description, model_used) = match provider {
+            "qwen" => {
+                let key = std::env::var("DASHSCOPE_API_KEY")
+                    .map_err(|_| "DASHSCOPE_API_KEY not set".to_string())?;
+                let model = default_vision_model("qwen");
+                let text = openai_style_vision(
+                    QWEN_CHAT_COMPLETIONS_URL,
+                    &key,
+                    model,
+                    text_prompt,
+                    &mime,
+                    &image_bytes,
+                )
+                .await?;
+                (text, model.to_string())
+            }
+            "zhipu" => {
+                let key = std::env::var("ZHIPU_API_KEY")
+                    .map_err(|_| "ZHIPU_API_KEY not set".to_string())?;
+                let model = default_vision_model("zhipu");
+                let text = openai_style_vision(
+                    ZHIPU_CHAT_COMPLETIONS_URL,
+                    &key,
+                    model,
+                    text_prompt,
+                    &mime,
+                    &image_bytes,
+                )
+                .await?;
+                (text, model.to_string())
+            }
+            "openai" => {
+                let key = std::env::var("OPENAI_API_KEY")
+                    .map_err(|_| "OPENAI_API_KEY not set".to_string())?;
+                let model = default_vision_model("openai");
+                let text = openai_style_vision(
+                    OPENAI_CHAT_COMPLETIONS_URL,
+                    &key,
+                    model,
+                    text_prompt,
+                    &mime,
+                    &image_bytes,
+                )
+                .await?;
+                (text, model.to_string())
+            }
+            "volcengine" | "doubao" => {
+                let key = std::env::var("VOLCENGINE_API_KEY")
+                    .map_err(|_| "VOLCENGINE_API_KEY not set".to_string())?;
+                let model = volcengine_vision_model();
+                let url = volcengine_chat_completions_url();
+                let text = openai_style_vision(
+                    &url,
+                    &key,
+                    &model,
+                    text_prompt,
+                    &mime,
+                    &image_bytes,
+                )
+                .await?;
+                (text, model)
+            }
+            "gemini" => {
+                return Err(
+                    "Gemini vision is not wired in MediaEngine yet. Use DASHSCOPE_API_KEY (Qwen-VL), \
+                     ZHIPU_API_KEY (GLM-4V), VOLCENGINE_API_KEY (豆包), or OPENAI_API_KEY."
+                        .into(),
+                );
+            }
+            "anthropic" => {
+                return Err(
+                    "Anthropic vision is not implemented in MediaEngine. Use DASHSCOPE_API_KEY, \
+                     ZHIPU_API_KEY, VOLCENGINE_API_KEY, or OPENAI_API_KEY."
+                        .into(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "Unsupported vision provider '{other}'. Use qwen, zhipu, volcengine, or openai."
+                ));
+            }
+        };
+
+        info!(provider, model = %model_used, chars = description.len(), "Image description complete");
+
         Ok(MediaUnderstanding {
             media_type: MediaType::Image,
-            description: format!(
-                "[Image description would be generated by {} provider]",
-                provider
-            ),
+            description,
             provider: provider.to_string(),
-            model: default_vision_model(provider).to_string(),
+            model: model_used,
         })
     }
 
@@ -180,10 +296,14 @@ impl MediaEngine {
         })
     }
 
-    /// Describe video using Gemini.
+    /// Describe video by **sampling frames** with ffmpeg, then running the same vision stack as images.
+    ///
+    /// Works with **Qwen-VL** (DashScope), **GLM-4V** (Zhipu), **豆包** (火山 Ark), or **OpenAI** vision models.
+    /// Requires `ffmpeg` / `ffprobe` on `PATH`. Enable `MediaConfig.video_description` in kernel config.
     pub async fn describe_video(
         &self,
         attachment: &MediaAttachment,
+        prompt: Option<&str>,
     ) -> Result<MediaUnderstanding, String> {
         attachment.validate()?;
         if attachment.media_type != MediaType::Video {
@@ -191,18 +311,155 @@ impl MediaEngine {
         }
 
         if !self.config.video_description {
-            return Err("Video description is disabled in configuration".into());
+            return Err("Video description is disabled in configuration (set media.video_description = true)".into());
         }
 
-        if std::env::var("GEMINI_API_KEY").is_err() && std::env::var("GOOGLE_API_KEY").is_err() {
-            return Err("Video description requires GEMINI_API_KEY or GOOGLE_API_KEY".into());
+        let _permit = self.semaphore.acquire().await.map_err(|e| e.to_string())?;
+
+        let provider = self
+            .config
+            .image_provider
+            .as_deref()
+            .or_else(|| detect_vision_provider())
+            .ok_or(
+                "No vision provider for video frames. Set DASHSCOPE_API_KEY, ZHIPU_API_KEY, VOLCENGINE_API_KEY, or OPENAI_API_KEY.",
+            )?;
+        if !matches!(
+            provider,
+            "qwen" | "zhipu" | "openai" | "volcengine" | "doubao"
+        ) {
+            return Err(format!(
+                "Video frame analysis requires provider qwen, zhipu, volcengine, or openai (got '{provider}'). \
+                 Set DASHSCOPE_API_KEY, ZHIPU_API_KEY, VOLCENGINE_API_KEY, or OPENAI_API_KEY."
+            ));
         }
+
+        let (video_path, is_temp_video) = materialize_video_path(attachment).await?;
+        let duration = tokio::task::spawn_blocking({
+            let p = video_path.clone();
+            move || ffprobe_duration_sec(&p)
+        })
+        .await
+        .map_err(|e| format!("ffprobe task join: {e}"))??;
+
+        if duration <= 0.0 || !duration.is_finite() {
+            if is_temp_video {
+                let _ = tokio::fs::remove_file(&video_path).await;
+            }
+            return Err("ffprobe returned invalid duration".into());
+        }
+
+        let offsets: Vec<f64> = [0.08, 0.28, 0.48, 0.68, 0.88]
+            .iter()
+            .map(|f| (duration * f).max(0.0))
+            .collect();
+
+        let default_prompt = "Describe what is visible in this frame: people, actions, setting, \
+             text on screen, and anything useful for picking viral short-video clips.";
+        let frame_prompt = prompt.unwrap_or(default_prompt);
+
+        let mut parts: Vec<String> = Vec::new();
+        let model = match provider {
+            "volcengine" | "doubao" => volcengine_vision_model(),
+            _ => default_vision_model(provider).to_string(),
+        };
+
+        for (i, t) in offsets.iter().enumerate() {
+            let frame_path = tokio::task::spawn_blocking({
+                let vid = video_path.clone();
+                let at = *t;
+                let idx = i;
+                move || extract_frame_jpeg(&vid, at, idx)
+            })
+            .await
+            .map_err(|e| format!("ffmpeg task join: {e}"))??;
+
+            let jpeg = tokio::fs::read(&frame_path)
+                .await
+                .map_err(|e| format!("read frame: {e}"))?;
+            let _ = tokio::fs::remove_file(&frame_path).await;
+
+            let text = match provider {
+                "qwen" => {
+                    let key = std::env::var("DASHSCOPE_API_KEY").map_err(|_| "DASHSCOPE_API_KEY not set")?;
+                    openai_style_vision(
+                        QWEN_CHAT_COMPLETIONS_URL,
+                        &key,
+                        &model,
+                        frame_prompt,
+                        "image/jpeg",
+                        &jpeg,
+                    )
+                    .await?
+                }
+                "zhipu" => {
+                    let key = std::env::var("ZHIPU_API_KEY").map_err(|_| "ZHIPU_API_KEY not set")?;
+                    openai_style_vision(
+                        ZHIPU_CHAT_COMPLETIONS_URL,
+                        &key,
+                        &model,
+                        frame_prompt,
+                        "image/jpeg",
+                        &jpeg,
+                    )
+                    .await?
+                }
+                "openai" => {
+                    let key = std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set")?;
+                    openai_style_vision(
+                        OPENAI_CHAT_COMPLETIONS_URL,
+                        &key,
+                        &model,
+                        frame_prompt,
+                        "image/jpeg",
+                        &jpeg,
+                    )
+                    .await?
+                }
+                "volcengine" | "doubao" => {
+                    let key =
+                        std::env::var("VOLCENGINE_API_KEY").map_err(|_| "VOLCENGINE_API_KEY not set")?;
+                    let url = volcengine_chat_completions_url();
+                    openai_style_vision(
+                        &url,
+                        &key,
+                        &model,
+                        frame_prompt,
+                        "image/jpeg",
+                        &jpeg,
+                    )
+                    .await?
+                }
+                _ => unreachable!(),
+            };
+
+            parts.push(format!(
+                "### ~{:.1}s (sample {}/{})\n{}",
+                t,
+                i + 1,
+                offsets.len(),
+                text.trim()
+            ));
+        }
+
+        if is_temp_video {
+            let _ = tokio::fs::remove_file(&video_path).await;
+        }
+
+        let description = format!(
+            "Video understanding ({} frames, duration {:.1}s):\n\n{}",
+            offsets.len(),
+            duration,
+            parts.join("\n\n")
+        );
+
+        info!(provider, model = %model, chars = description.len(), "Video frame description complete");
 
         Ok(MediaUnderstanding {
             media_type: MediaType::Video,
-            description: "[Video description would be generated by Gemini]".to_string(),
-            provider: "gemini".to_string(),
-            model: "gemini-2.5-flash".to_string(),
+            description,
+            provider: provider.to_string(),
+            model,
         })
     }
 
@@ -225,7 +482,7 @@ impl MediaEngine {
                 match attachment.media_type {
                     MediaType::Image => engine.describe_image(&attachment).await,
                     MediaType::Audio => engine.transcribe_audio(&attachment).await,
-                    MediaType::Video => engine.describe_video(&attachment).await,
+                    MediaType::Video => engine.describe_video(&attachment, None).await,
                 }
             });
             handles.push(handle);
@@ -242,16 +499,220 @@ impl MediaEngine {
     }
 }
 
-/// Detect which vision provider is available based on environment variables.
+/// Read raw image bytes and MIME type from an attachment.
+async fn read_image_bytes(attachment: &MediaAttachment) -> Result<(Vec<u8>, String), String> {
+    match &attachment.source {
+        MediaSource::FilePath { path } => {
+            let data = tokio::fs::read(path)
+                .await
+                .map_err(|e| format!("Failed to read image '{path}': {e}"))?;
+            Ok((data, attachment.mime_type.clone()))
+        }
+        MediaSource::Base64 { data, mime_type } => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| format!("Invalid base64 image: {e}"))?;
+            Ok((bytes, mime_type.clone()))
+        }
+        MediaSource::Url { url } => Err(format!("URL image source not supported: {url}")),
+    }
+}
+
+/// Returns `(path, is_temp_file)`.
+async fn materialize_video_path(attachment: &MediaAttachment) -> Result<(PathBuf, bool), String> {
+    match &attachment.source {
+        MediaSource::FilePath { path } => Ok((PathBuf::from(path), false)),
+        MediaSource::Base64 { data, .. } => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|e| format!("Invalid base64 video: {e}"))?;
+            let p = std::env::temp_dir().join(format!("openfang_vid_{}.mp4", uuid::Uuid::new_v4()));
+            tokio::fs::write(&p, bytes)
+                .await
+                .map_err(|e| format!("temp video write: {e}"))?;
+            Ok((p, true))
+        }
+        MediaSource::Url { url } => Err(format!("URL video source not supported: {url}")),
+    }
+}
+
+fn ffprobe_duration_sec(path: &Path) -> Result<f64, String> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("ffprobe failed to start: {e}. Is ffmpeg installed?"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("ffprobe error: {}", err.trim()));
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let v: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| format!("ffprobe returned non-numeric duration: {}", s.trim()))?;
+    Ok(v)
+}
+
+fn extract_frame_jpeg(video: &Path, at_sec: f64, idx: usize) -> Result<PathBuf, String> {
+    let out = std::env::temp_dir().join(format!(
+        "openfang_frame_{}_{}.jpg",
+        uuid::Uuid::new_v4(),
+        idx
+    ));
+    let ss = format!("{:.3}", at_sec);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            &ss,
+            "-i",
+        ])
+        .arg(video)
+        .args(["-frames:v", "1", "-q:v", "2"])
+        .arg(&out)
+        .status()
+        .map_err(|e| format!("ffmpeg failed to start: {e}. Is ffmpeg installed?"))?;
+    if !status.success() {
+        return Err("ffmpeg frame extract failed".into());
+    }
+    Ok(out)
+}
+
+fn parse_chat_completion_content(body: &serde_json::Value) -> Result<String, String> {
+    let content = body
+        .pointer("/choices/0/message/content")
+        .ok_or("Missing choices[0].message.content in API response")?;
+    if let Some(s) = content.as_str() {
+        let t = s.trim();
+        if t.is_empty() {
+            return Err("Vision model returned empty content".into());
+        }
+        return Ok(t.to_string());
+    }
+    if let Some(arr) = content.as_array() {
+        let mut out = String::new();
+        for part in arr {
+            if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
+                out.push_str(t);
+            }
+        }
+        let t = out.trim();
+        if !t.is_empty() {
+            return Ok(t.to_string());
+        }
+    }
+    Err("Unexpected vision API response shape".into())
+}
+
+/// OpenAI-compatible `/chat/completions` with a single `image_url` data URI.
+async fn openai_style_vision(
+    endpoint: &str,
+    api_key: &str,
+    model: &str,
+    user_text: &str,
+    image_mime: &str,
+    image_bytes: &[u8],
+) -> Result<String, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+    let data_uri = format!("data:{image_mime};base64,{b64}");
+
+    let body = json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": user_text },
+                { "type": "image_url", "image_url": { "url": data_uri } }
+            ]
+        }],
+        "max_tokens": 2048
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("Vision HTTP error: {e}"))?;
+
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Vision read body: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!("Vision API {}: {}", status, text));
+    }
+
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("Vision JSON parse: {e}: {text}"))?;
+    parse_chat_completion_content(&v)
+}
+
+/// `{VOLCENGINE_BASE_URL}/chat/completions` — 火山引擎方舟 OpenAPI（豆包等）.
+fn volcengine_chat_completions_url() -> String {
+    format!(
+        "{}/chat/completions",
+        VOLCENGINE_BASE_URL.trim_end_matches('/')
+    )
+}
+
+/// 豆包 / 多模态推理接入点：默认 **Seed 2.0 Pro**；可改为 `doubao-seed-2-0-lite-260215` / `mini` 或方舟 `ep-xxxx`。
+fn volcengine_vision_model() -> String {
+    std::env::var("OPENFANG_VOLCENGINE_VISION_MODEL").unwrap_or_else(|_| {
+        "doubao-seed-2-0-pro-260215".to_string()
+    })
+}
+
+/// Detect which vision provider to use (`OPENFANG_VISION_PROVIDER` overrides).
 fn detect_vision_provider() -> Option<&'static str> {
-    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        return Some("anthropic");
+    if let Ok(p) = std::env::var("OPENFANG_VISION_PROVIDER") {
+        let low = p.to_lowercase();
+        match low.as_str() {
+            "qwen" | "dashscope" => return Some("qwen"),
+            "zhipu" | "glm" | "bigmodel" => return Some("zhipu"),
+            "volcengine" | "doubao" | "ark" => return Some("volcengine"),
+            "openai" => return Some("openai"),
+            "gemini" | "google" => return Some("gemini"),
+            "anthropic" | "claude" => return Some("anthropic"),
+            _ => {}
+        }
+    }
+    if std::env::var("DASHSCOPE_API_KEY").is_ok() {
+        return Some("qwen");
+    }
+    if std::env::var("ZHIPU_API_KEY").is_ok() {
+        return Some("zhipu");
+    }
+    if std::env::var("VOLCENGINE_API_KEY").is_ok() {
+        return Some("volcengine");
     }
     if std::env::var("OPENAI_API_KEY").is_ok() {
         return Some("openai");
     }
     if std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok() {
         return Some("gemini");
+    }
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        return Some("anthropic");
     }
     None
 }
@@ -372,8 +833,11 @@ fn detect_audio_provider() -> Option<&'static str> {
 /// Get the default vision model for a provider.
 fn default_vision_model(provider: &str) -> &str {
     match provider {
-        "anthropic" => "claude-sonnet-4-20250514",
+        "qwen" => "qwen-vl-plus",
+        "zhipu" => "glm-4v-plus",
+        "volcengine" | "doubao" => "doubao-seed-2-0-pro-260215",
         "openai" => "gpt-4o",
+        "anthropic" => "claude-sonnet-4-20250514",
         "gemini" => "gemini-2.5-flash",
         _ => "unknown",
     }
@@ -488,7 +952,7 @@ mod tests {
             },
             size_bytes: 1024,
         };
-        let result = engine.describe_video(&attachment).await;
+        let result = engine.describe_video(&attachment, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("disabled"));
     }
@@ -502,6 +966,16 @@ mod tests {
 
     #[test]
     fn test_default_vision_models() {
+        assert_eq!(default_vision_model("qwen"), "qwen-vl-plus");
+        assert_eq!(default_vision_model("zhipu"), "glm-4v-plus");
+        assert_eq!(
+            default_vision_model("volcengine"),
+            "doubao-seed-2-0-pro-260215"
+        );
+        assert_eq!(
+            default_vision_model("doubao"),
+            "doubao-seed-2-0-pro-260215"
+        );
         assert_eq!(
             default_vision_model("anthropic"),
             "claude-sonnet-4-20250514"

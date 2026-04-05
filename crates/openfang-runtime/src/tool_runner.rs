@@ -324,6 +324,7 @@ pub async fn execute_tool(
 
         // Media understanding tools
         "media_describe" => tool_media_describe(input, media_engine).await,
+        "media_describe_video" => tool_media_describe_video(input, media_engine).await,
         "media_transcribe" => tool_media_transcribe(input, media_engine).await,
 
         // Image generation tool
@@ -981,12 +982,24 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Media understanding tools ---
         ToolDefinition {
             name: "media_describe".to_string(),
-            description: "Describe an image using a vision-capable LLM. Auto-selects the best available provider (Anthropic, OpenAI, or Gemini). Returns a text description of the image content.".to_string(),
+            description: "Describe an image using a vision LLM. Prefers mainland APIs when keys are set: DASHSCOPE_API_KEY (Qwen-VL), ZHIPU_API_KEY (GLM-4V), VOLCENGINE_API_KEY (火山豆包 Ark), then OPENAI_API_KEY. Optional OPENFANG_VISION_PROVIDER=qwen|zhipu|volcengine|openai. For 豆包 Seed 2.0, optional OPENFANG_VOLCENGINE_VISION_MODEL: doubao-seed-2-0-pro-260215 (default), doubao-seed-2-0-lite-260215, doubao-seed-2-0-mini-260215, or ep-xxx.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the image file (relative to workspace)" },
                     "prompt": { "type": "string", "description": "Optional prompt to guide the description (e.g., 'Extract all text from this image')" }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "media_describe_video".to_string(),
+            description: "Understand a local video by sampling frames with ffmpeg and calling the same vision stack as images (Qwen-VL / GLM-4V / 火山豆包 Ark / OpenAI). Requires media.video_description=true in config, ffmpeg/ffprobe on PATH, and DASHSCOPE_API_KEY, ZHIPU_API_KEY, VOLCENGINE_API_KEY, or OPENAI_API_KEY.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the video file (mp4/mov/webm)" },
+                    "prompt": { "type": "string", "description": "Optional per-frame instruction for the vision model" }
                 },
                 "required": ["path"]
             }),
@@ -2790,7 +2803,49 @@ async fn tool_media_describe(
         size_bytes: data.len() as u64,
     };
 
-    let understanding = engine.describe_image(&attachment).await?;
+    let prompt = input["prompt"].as_str();
+    let understanding = engine
+        .describe_image_prompt(&attachment, prompt)
+        .await?;
+    serde_json::to_string_pretty(&understanding).map_err(|e| format!("Serialize error: {e}"))
+}
+
+/// Sample frames from a video and describe them with the vision stack.
+async fn tool_media_describe_video(
+    input: &serde_json::Value,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+) -> Result<String, String> {
+    let engine = media_engine.ok_or("Media engine not available. Check media configuration.")?;
+    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let _ = validate_path(path)?;
+
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("Failed to stat video file: {e}"))?;
+
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        _ => return Err(format!("Unsupported video format: .{ext}")),
+    };
+
+    let attachment = openfang_types::media::MediaAttachment {
+        media_type: openfang_types::media::MediaType::Video,
+        mime_type: mime.to_string(),
+        source: openfang_types::media::MediaSource::FilePath {
+            path: path.to_string(),
+        },
+        size_bytes: meta.len(),
+    };
+
+    let prompt = input["prompt"].as_str();
+    let understanding = engine.describe_video(&attachment, prompt).await?;
     serde_json::to_string_pretty(&understanding).map_err(|e| format!("Serialize error: {e}"))
 }
 
@@ -3298,8 +3353,8 @@ mod tests {
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
         assert!(
-            tools.len() >= 39,
-            "Expected at least 39 tools, got {}",
+            tools.len() >= 40,
+            "Expected at least 40 tools, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3337,8 +3392,9 @@ mod tests {
         assert!(names.contains(&"browser_wait"));
         assert!(names.contains(&"browser_run_js"));
         assert!(names.contains(&"browser_back"));
-        // 3 media/image generation tools
+        // 4 media/image generation tools
         assert!(names.contains(&"media_describe"));
+        assert!(names.contains(&"media_describe_video"));
         assert!(names.contains(&"media_transcribe"));
         assert!(names.contains(&"image_generate"));
         // 3 cron tools
